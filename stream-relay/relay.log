@@ -1,0 +1,29 @@
+nohup: ignoring input
+[relay] WebSocket relay listening on ws://0.0.0.0:8765
+node:events:502
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: listen EADDRINUSE: address already in use :::8765
+    at Server.setupListenHandle [as _listen2] (node:net:1908:16)
+    at listenInCluster (node:net:1965:12)
+    at Server.listen (node:net:2067:7)
+    at new WebSocketServer (/var/www/dj-dashboard/stream-relay/node_modules/ws/lib/websocket-server.js:106:20)
+    at Object.<anonymous> (/var/www/dj-dashboard/stream-relay/index.js:17:13)
+    at Module._compile (node:internal/modules/cjs/loader:1521:14)
+    at Module._extensions..js (node:internal/modules/cjs/loader:1623:10)
+    at Module.load (node:internal/modules/cjs/loader:1266:32)
+    at Module._load (node:internal/modules/cjs/loader:1091:12)
+    at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:164:12)
+Emitted 'error' event on WebSocketServer instance at:
+    at Server.emit (node:events:524:28)
+    at emitErrorNT (node:net:1944:8)
+    at process.processTicksAndRejections (node:internal/process/task_queues:82:21) {
+  code: 'EADDRINUSE',
+  errno: -98,
+  syscall: 'listen',
+  address: '::',
+  port: 8765
+}
+
+Node.js v20.20.0
