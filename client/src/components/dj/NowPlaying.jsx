@@ -5,6 +5,7 @@ import { getNowPlaying } from '../../api/azuracast';
 
 export default function NowPlaying({ stationId = '1' }) {
     const [data, setData] = useState(null);
+    const [relayMeta, setRelayMeta] = useState(null);
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
@@ -28,6 +29,34 @@ export default function NowPlaying({ stationId = '1' }) {
         return () => clearInterval(interval);
     }, [stationId]);
 
+    // Poll the relay metadata if a DJ is live
+    useEffect(() => {
+        if (!data?.live?.is_live) {
+            setRelayMeta(null);
+            return;
+        }
+
+        const fetchRelayMeta = async () => {
+            try {
+                const res = await fetch('/stream-relay/metadata');
+                if (res.ok) {
+                    const meta = await res.json();
+                    if (meta && meta.live) {
+                        setRelayMeta(meta);
+                    } else {
+                        setRelayMeta(null);
+                    }
+                }
+            } catch (err) {
+                console.error('Failed to fetch relay metadata', err);
+            }
+        };
+
+        fetchRelayMeta();
+        const interval = setInterval(fetchRelayMeta, 5000);
+        return () => clearInterval(interval);
+    }, [data?.live?.is_live]);
+
     if (loading && !data) {
         return (
             <div className="h-full min-h-[300px] flex items-center justify-center text-zinc-500 animate-pulse text-sm">
@@ -40,13 +69,18 @@ export default function NowPlaying({ stationId = '1' }) {
     const song = np?.song;
     const listeners = data?.listeners?.total || 0;
 
+    // Override with relay metadata if available
+    const displayTitle = relayMeta?.title || song?.title || 'Static Silence';
+    const displayArtist = relayMeta?.artist || song?.artist || 'Unknown Signal';
+    const displayArt = relayMeta?.artwork || song?.art || 'https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?q=80&w=1000&auto=format&fit=crop';
+
     return (
         <div className="relative h-full overflow-hidden rounded-xl bg-zinc-800 p-6 flex flex-col group">
             {/* Background Image styling similar to the NFT dashboard hero */}
             <div
                 className="absolute inset-0 opacity-20 transition-all duration-700 group-hover:opacity-30 group-hover:scale-105"
                 style={{
-                    backgroundImage: `url(${song?.art || 'https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?q=80&w=1000&auto=format&fit=crop'})`,
+                    backgroundImage: `url(${displayArt})`,
                     backgroundSize: 'cover',
                     backgroundPosition: 'center'
                 }}
@@ -63,10 +97,10 @@ export default function NowPlaying({ stationId = '1' }) {
                             <span className="text-xs font-bold uppercase tracking-wider text-red-500">Live</span>
                         </div>
                         <h2 className="text-3xl font-black text-white leading-tight break-words pr-4">
-                            {song?.title || 'Static Silence'}
+                            {displayTitle}
                         </h2>
                         <p className="text-zinc-400 text-lg font-medium mt-1">
-                            {song?.artist || 'Unknown Signal'}
+                            {displayArtist}
                         </p>
                     </div>
                 </div>

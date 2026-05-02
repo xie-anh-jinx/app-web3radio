@@ -363,17 +363,29 @@ export default function LiveBroadcast({ isDJ = false, onBroadcastState }) {
         }
     };
 
+    const fileToBase64 = (file) => {
+        return new Promise((resolve, reject) => {
+            if (!file) return resolve(null);
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = error => reject(error);
+        });
+    };
+
     const updateLiveInfo = useCallback(async () => {
         try {
+            const artBase64 = await fileToBase64(artwork);
             const metadata = {
                 title: streamTitle,
-                artist: streamArtist
+                artist: streamArtist,
+                artwork: artBase64
             };
 
-            // 1. Push to AzuraCast API (affects player metadata)
-            await updateLiveMetadata('kotaromiyabi', metadata);
+            // 1. Push to AzuraCast API (affects player metadata - text only)
+            await updateLiveMetadata('kotaromiyabi', { title: streamTitle, artist: streamArtist });
             
-            // 2. Push to WebSocket Relay (affects Icecast logs/headers where possible)
+            // 2. Push to WebSocket Relay (affects app UI via relay's /metadata endpoint)
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
                 wsRef.current.send(JSON.stringify({
                     type: 'update_metadata',
@@ -385,10 +397,10 @@ export default function LiveBroadcast({ isDJ = false, onBroadcastState }) {
         } catch (err) {
             console.error('[LiveBroadcast] Failed to update metadata:', err);
         }
-    }, [streamTitle, streamArtist]);
+    }, [streamTitle, streamArtist, artwork]);
 
 
-    const goLive = useCallback(() => {
+    const goLive = useCallback(async () => {
         if (!streamRef.current) return;
         setState(STATES.CONNECTING);
         setStatusMsg('Connecting to AzuraCast...');
@@ -399,18 +411,35 @@ export default function LiveBroadcast({ isDJ = false, onBroadcastState }) {
         ws.binaryType = 'arraybuffer';
         wsRef.current = ws;
 
+        const artBase64 = await fileToBase64(artwork);
+
         ws.onopen = () => {
             setStatusMsg('Connection open — starting stream...');
+            
+            // Heartbeat to keep connection alive
+            ws.pingInterval = setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'ping' }));
+                }
+            }, 30000);
 
-            // Send initialization data with custom metadata
+            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+                ? 'audio/webm;codecs=opus' 
+                : MediaRecorder.isTypeSupported('audio/mpeg')
+                    ? 'audio/mpeg'
+                    : 'audio/webm';
+
+            // Send initialization data with custom metadata and codec info
             ws.send(JSON.stringify({
                 type: 'init',
                 title: streamTitle,
-                artist: streamArtist
+                artist: streamArtist,
+                artwork: artBase64,
+                mimeType: mimeType
             }));
 
             const recorder = new MediaRecorder(streamRef.current, {
-                mimeType: MediaRecorder.isTypeSupported('audio/mpeg') ? 'audio/mpeg' : 'audio/webm;codecs=opus',
+                mimeType,
                 audioBitsPerSecond: 128000,
             });
             recorderRef.current = recorder;
@@ -421,10 +450,12 @@ export default function LiveBroadcast({ isDJ = false, onBroadcastState }) {
         ws.onmessage = (ev) => {
             try {
                 const msg = JSON.parse(ev.data);
-                if (msg.type === 'connected') {
+                if (msg.type === 'buffering') {
+                    setStatusMsg('⏳ Buffering audio... (please wait ~2 sec)');
+                } else if (msg.type === 'connected') {
                     setState(STATES.LIVE);
                     setStatusMsg('🔴 LIVE — broadcasting to ' + msg.mount);
-                    updateLiveInfo(); // Push to AzuraCast API as well
+                    // updateLiveInfo(); removed: calling Azuracast backend/metadata right after connecting causes Liquidsoap to restart
                     if (jingleRef.current) {
                         jingleRef.current.currentTime = 0;
                         jingleRef.current.play().catch(e => console.error("Jingle failed:", e));
@@ -438,9 +469,34 @@ export default function LiveBroadcast({ isDJ = false, onBroadcastState }) {
             } catch { }
         };
 
-        ws.onerror = () => { setError('WebSocket connection failed.'); setState(STATES.ERROR); };
-        ws.onclose = () => { if (state === STATES.LIVE || state === STATES.CONNECTING) stopBroadcast(); };
-    }, [state, streamTitle, streamArtist]);
+        ws.onerror = (err) => { 
+            console.error('[LiveBroadcast] WebSocket error:', err);
+            setError('WebSocket connection failed.'); 
+            setState(STATES.ERROR); 
+        };
+        ws.onclose = (e) => { 
+            console.warn(`[LiveBroadcast] WebSocket closed. Code: ${e.code}, Reason: ${e.reason}`);
+            clearInterval(ws.pingInterval);
+            if (state === STATES.LIVE || state === STATES.CONNECTING) {
+                if (e.code !== 1000) {
+                    setError(`Connection lost (${e.code}). Please check your internet.`);
+                }
+                stopBroadcast(); 
+            }
+        };
+    }, [state, streamTitle, streamArtist, artwork]);
+
+    // Warning when leaving the page while live
+    useEffect(() => {
+        const handleBeforeUnload = (e) => {
+            if (state === STATES.LIVE) {
+                e.preventDefault();
+                e.returnValue = '';
+            }
+        };
+        window.addEventListener('beforeunload', handleBeforeUnload);
+        return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+    }, [state]);
 
     const stopBroadcast = useCallback(() => {
         if (recorderRef.current && recorderRef.current.state !== 'inactive') recorderRef.current.stop();

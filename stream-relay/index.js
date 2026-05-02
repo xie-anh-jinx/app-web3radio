@@ -1,28 +1,72 @@
-/**
- * stream-relay/index.js
- *
- * WebSocket-to-Icecast relay for the DJ Dashboard live broadcast feature.
- */
-
 const WebSocket = require('ws');
-const net = require('net');
+const net       = require('net');
+const http      = require('http');
+const { spawn } = require('child_process');
 
-const WS_PORT      = 8765;
-const ICECAST_HOST = '127.0.0.1';
-const ICECAST_PORT = 8005;       // AzuraCast DJ Harbor port
+const WS_PORT             = 8765;
+const ICECAST_HOST        = '127.0.0.1';
+const ICECAST_PORT        = 8005;   // AzuraCast DJ Harbor port
 const ICECAST_MOUNT       = '/';
 const ICECAST_SOURCE_USER = 'web3radio';
 const ICECAST_SOURCE_PASS = 'web3radio';
 
-const wss = new WebSocket.Server({ port: WS_PORT });
-console.log(`[relay] WebSocket relay listening on ws://0.0.0.0:${WS_PORT}`);
+// How many audio chunks to buffer before starting FFmpeg pipeline
+const PRE_BUFFER_CHUNKS   = 10;
+
+// Store current live metadata in memory for the app to poll
+let currentLiveMetadata = null;
+
+const server = http.createServer((req, res) => {
+    // CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+
+    if (req.url === '/metadata' || req.url === '/stream-relay/metadata') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(currentLiveMetadata || { live: false }));
+    } else {
+        res.writeHead(404);
+        res.end('Not Found');
+    }
+});
+
+const wss = new WebSocket.Server({ server });
+
+// Keep-alive heartbeat
+const interval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
+wss.on('close', () => {
+    clearInterval(interval);
+});
+
+console.log(`[relay] WebSocket & HTTP relay listening on port ${WS_PORT}`);
 
 wss.on('connection', (ws, req) => {
     const clientIp = req.socket.remoteAddress;
     console.log(`[relay] Browser client connected from ${clientIp}`);
 
-    let icecast = null;          // null until 'init' message received
-    let pendingAudio = [];       // audio chunks buffered before init
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
+    let icecastSock   = null;
+    let ffmpegProc    = null;
+    let preBuffer     = [];
+    let pipelineReady = false;
+    let streamMeta    = null;  // stored from init message
+    let cleaning      = false;
 
     // ── helpers ────────────────────────────────────────────────
     function safeSend(obj) {
@@ -32,82 +76,174 @@ wss.on('connection', (ws, req) => {
     }
 
     function cleanup(reason) {
+        if (cleaning) return;
+        cleaning = true;
         console.log(`[relay] Cleanup: ${reason}`);
-        if (icecast) {
-            try { icecast.destroy(); } catch {}
-            icecast = null;
+        
+        // Reset global metadata if this was the active stream
+        currentLiveMetadata = null;
+
+        if (ffmpegProc) {
+            try { ffmpegProc.stdin.end(); } catch {}
+            setTimeout(() => {
+                try { if (ffmpegProc) ffmpegProc.kill('SIGTERM'); } catch {}
+                ffmpegProc = null;
+            }, 500);
         }
-        pendingAudio = [];
+        if (icecastSock) {
+            try { icecastSock.destroy(); } catch {}
+            icecastSock = null;
+        }
+        preBuffer     = [];
+        pipelineReady = false;
     }
 
-    // ── connect to Icecast with custom metadata ─────────────────
-    function connectToIcecast(streamTitle, streamArtist) {
-        const streamName = `${streamArtist} - ${streamTitle}`;
-        console.log(`[relay] Opening Icecast connection for: ${streamName}`);
+    // ── start the full pipeline once we have enough buffered audio ──
+    function startPipeline() {
+        if (pipelineReady || !streamMeta) return;
 
-        const sock = net.createConnection({ host: ICECAST_HOST, port: ICECAST_PORT });
+        const { streamName, mimeType } = streamMeta;
+        console.log(`[relay] Pre-buffer full (${preBuffer.length} chunks) — starting FFmpeg`);
 
-        sock.on('connect', () => {
-            const auth   = Buffer.from(`${ICECAST_SOURCE_USER}:${ICECAST_SOURCE_PASS}`).toString('base64');
-            const header = [
-                `SOURCE ${ICECAST_MOUNT} ICE/1.0`,
-                `Authorization: Basic ${auth}`,
-                `Host: ${ICECAST_HOST}`,
-                `Content-Type: audio/mpeg`,
-                `ice-name: ${streamName}`,
-                `ice-public: 1`,
-                `ice-description: ${streamName}`,
-                `ice-audio-info: bitrate=128;samplerate=44100;channels=2`,
-                '',
-                ''
-            ].join('\r\n');
+        const isWebM = mimeType && (mimeType.includes('webm') || mimeType.includes('opus'));
+        const inputFormat = isWebM ? 'webm' : 'mp3';
 
-            sock.write(header);
-            console.log(`[relay] Icecast SOURCE sent — confirming to browser`);
-            safeSend({ type: 'connected', mount: ICECAST_MOUNT });
+        const ffArgs = [
+            '-hide_banner',
+            '-loglevel', 'warning',
+            '-probesize', '65536',
+            '-analyzeduration', '1000000',
+            '-fflags', '+nobuffer+flush_packets',
+            '-f', inputFormat,
+            '-i', 'pipe:0',
+            '-acodec', 'libmp3lame',
+            '-ab', '128k',
+            '-ar', '44100',
+            '-ac', '2',
+            '-flush_packets', '1',
+            '-f', 'mp3',
+            'pipe:1'
+        ];
 
-            // Flush any audio that arrived before icecast was ready
-            if (pendingAudio.length > 0) {
-                pendingAudio.forEach(chunk => sock.write(chunk));
-                pendingAudio = [];
+        console.log(`[relay] Spawning FFmpeg: ffmpeg ${ffArgs.join(' ')}`);
+        ffmpegProc = spawn('ffmpeg', ffArgs);
+
+        let ffmpegOutputStarted = false;
+        let mp3Buffer = [];
+        let icecastConnecting = false;
+
+        function connectIcecast() {
+            if (icecastConnecting || icecastSock) return;
+            icecastConnecting = true;
+            console.log(`[relay] FFmpeg produced output. Connecting to Icecast...`);
+
+            icecastSock = net.createConnection({ host: ICECAST_HOST, port: ICECAST_PORT });
+
+            icecastSock.on('connect', () => {
+                const auth = Buffer.from(`${ICECAST_SOURCE_USER}:${ICECAST_SOURCE_PASS}`).toString('base64');
+                const header = [
+                    `SOURCE ${ICECAST_MOUNT} ICE/1.0`,
+                    `Authorization: Basic ${auth}`,
+                    `User-Agent: butt/0.1.31`,
+                    `Host: ${ICECAST_HOST}`,
+                    `Content-Type: audio/mpeg`,
+                    `ice-name: ${streamName}`,
+                    `ice-public: 0`,
+                    `ice-description: ${streamName}`,
+                    `ice-audio-info: channels=2;samplerate=44100;bitrate=128`,
+                    '',
+                    ''
+                ].join('\r\n');
+
+                icecastSock.write(header);
+                console.log(`[relay] Icecast SOURCE header sent — waiting for 200 OK`);
+            });
+
+            icecastSock.on('data', (d) => {
+                const resp = d.toString();
+                if (!pipelineReady) {
+                    if (resp.includes('200 OK')) {
+                        console.log(`[relay] ✅ Icecast handshake successful — pipeline is LIVE`);
+                        pipelineReady = true;
+                        safeSend({ type: 'connected', mount: ICECAST_MOUNT });
+                        
+                        // Flush accumulated MP3 buffer
+                        if (mp3Buffer.length > 0) {
+                            console.log(`[relay] Flushing ${mp3Buffer.length} MP3 chunks to Icecast`);
+                            mp3Buffer.forEach(chunk => icecastSock.write(chunk));
+                            mp3Buffer = [];
+                        }
+                    } else {
+                        console.error('[relay] Icecast rejected:', resp.trim());
+                        safeSend({ type: 'error', message: 'Icecast rejected: ' + resp.trim() });
+                        if (ws.readyState === WebSocket.OPEN) ws.close();
+                    }
+                }
+            });
+
+            icecastSock.on('error', (err) => {
+                console.error('[relay] Icecast socket error:', err.message);
+                safeSend({ type: 'error', message: err.message });
+                if (ws.readyState === WebSocket.OPEN) ws.close();
+            });
+
+            icecastSock.on('close', () => {
+                console.log('[relay] Icecast connection closed');
+                safeSend({ type: 'disconnected' });
+                cleanup('icecast closed');
+                if (ws.readyState === WebSocket.OPEN) ws.close();
+            });
+        }
+
+        ffmpegProc.stdout.on('data', (chunk) => {
+            if (!ffmpegOutputStarted) {
+                ffmpegOutputStarted = true;
+                console.log(`[relay] FFmpeg started producing MP3 output (${chunk.length} bytes)`);
+                connectIcecast();
+            }
+            
+            if (pipelineReady && icecastSock && !icecastSock.destroyed) {
+                icecastSock.write(chunk);
+            } else {
+                mp3Buffer.push(chunk);
             }
         });
 
-        sock.on('data', (d) => {
-            const resp = d.toString();
-            if (resp.includes('401') || resp.includes('403') || resp.includes('Error')) {
-                console.error('[relay] Icecast auth/mount error:', resp.trim());
-                safeSend({ type: 'error', message: 'Icecast rejected connection: ' + resp.trim() });
-                ws.close();
-            }
+        ffmpegProc.stderr.on('data', (d) => {
+            const msg = d.toString().trim();
+            if (msg) console.log(`[ffmpeg] ${msg}`);
         });
 
-        sock.on('error', (err) => {
-            console.error('[relay] Icecast socket error:', err.message);
-            safeSend({ type: 'error', message: err.message });
-            ws.close();
-        });
-
-        sock.on('close', () => {
-            console.log('[relay] Icecast connection closed');
-            safeSend({ type: 'disconnected' });
+        ffmpegProc.on('error', (err) => {
+            console.error('[relay] FFmpeg spawn error:', err.message);
+            safeSend({ type: 'error', message: 'Transcoder error: ' + err.message });
             if (ws.readyState === WebSocket.OPEN) ws.close();
         });
 
-        icecast = sock;
+        ffmpegProc.on('close', (code) => {
+            console.log(`[relay] FFmpeg exited with code ${code}`);
+            cleanup('ffmpeg closed');
+            if (ws.readyState === WebSocket.OPEN) ws.close();
+        });
+
+        console.log(`[relay] Flushing pre-buffer into FFmpeg...`);
+        for (const chunk of preBuffer) {
+            if (ffmpegProc.stdin.writable) {
+                ffmpegProc.stdin.write(chunk);
+            }
+        }
+        preBuffer = [];
     }
 
     // ── incoming messages from browser ──────────────────────────
     ws.on('message', (data) => {
         let isString = typeof data === 'string';
-        let strData = '';
-        
+        let strData  = '';
+
         if (!isString && Buffer.isBuffer(data)) {
-            // Check if this is a JSON message pretending to be binary
-            const prefix = data.slice(0, 1).toString();
-            if (prefix === '{') {
+            if (data[0] === 0x7B) { // '{' character
                 isString = true;
-                strData = data.toString('utf8');
+                strData  = data.toString('utf8');
             }
         } else if (isString) {
             strData = data;
@@ -116,16 +252,36 @@ wss.on('connection', (ws, req) => {
         if (isString) {
             try {
                 const msg = JSON.parse(strData);
-                if (msg.type === 'init' && !icecast) {
-                    connectToIcecast(
-                        (msg.title  || 'Live DJ Set').trim(),
-                        (msg.artist || 'Web3Radio DJ').trim()
-                    );
-                } else if (msg.type === 'update_metadata' && icecast) {
-                    const streamName = `${(msg.artist || 'Web3Radio DJ').trim()} - ${(msg.title || 'Live DJ Set').trim()}`;
-                    console.log(`[relay] Received live metadata update: ${streamName}`);
-                    // Note: We can't easily update Icecast SOURCE headers mid-stream, 
-                    // but the frontend is now also pushing to AzuraCast API directly.
+                if (msg.type === 'init' && !streamMeta) {
+                    const title  = (msg.title  || 'Live DJ Set').trim();
+                    const artist = (msg.artist || 'Web3Radio DJ').trim();
+                    streamMeta = {
+                        streamName: `${artist} - ${title}`,
+                        mimeType: msg.mimeType || 'audio/webm;codecs=opus'
+                    };
+                    
+                    // Store global metadata
+                    currentLiveMetadata = {
+                        live: true,
+                        title: title,
+                        artist: artist,
+                        artwork: msg.artwork || null,
+                        timestamp: Date.now()
+                    };
+
+                    console.log(`[relay] Init received: ${streamMeta.streamName}`);
+                    safeSend({ type: 'buffering', message: 'Buffering audio...' });
+                } else if (msg.type === 'update_metadata') {
+                    const title = (msg.title || '').trim();
+                    const artist = (msg.artist || '').trim();
+                    
+                    currentLiveMetadata = {
+                        ...currentLiveMetadata,
+                        title: title,
+                        artist: artist,
+                        artwork: msg.artwork || currentLiveMetadata?.artwork
+                    };
+                    console.log(`[relay] Metadata update: ${artist} - ${title}`);
                 } else if (msg.type === 'stop') {
                     console.log('[relay] Client requested stop');
                     cleanup('stop message');
@@ -137,11 +293,16 @@ wss.on('connection', (ws, req) => {
             return;
         }
 
-        // Binary audio
-        if (icecast && icecast.writable) {
-            icecast.write(data);
-        } else {
-            pendingAudio.push(data);
+        // Binary audio data
+        if (!streamMeta) return;
+
+        if (!pipelineReady && !ffmpegProc) {
+            preBuffer.push(data);
+            if (preBuffer.length >= PRE_BUFFER_CHUNKS) {
+                startPipeline();
+            }
+        } else if (ffmpegProc && ffmpegProc.stdin.writable) {
+            ffmpegProc.stdin.write(data);
         }
     });
 
@@ -156,5 +317,9 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-process.on('SIGINT',  () => { wss.close(() => process.exit(0)); });
-process.on('SIGTERM', () => { wss.close(() => process.exit(0)); });
+server.listen(WS_PORT, () => {
+    console.log(`[relay] Server running on port ${WS_PORT}`);
+});
+
+process.on('SIGINT',  () => { server.close(() => process.exit(0)); });
+process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
